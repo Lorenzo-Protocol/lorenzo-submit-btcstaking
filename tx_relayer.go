@@ -134,6 +134,7 @@ func (r *TxRelayer) fetchMempoolTxsLoop() {
 			_ = r.db.InsertMintTransactionToBridge(validMempoolTxs)
 			validMempoolTxs = nil // clean, for next round
 			time.Sleep(interval)
+			continue
 		}
 
 		preTxid := ""
