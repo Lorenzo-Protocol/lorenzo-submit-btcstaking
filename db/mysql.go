@@ -194,6 +194,9 @@ func (db *MysqlDB) InsertMintTransactionToBridge(txs []*BtcDepositTx) (err error
 			LorenzoAddr:    tx.LorenzoAddress,
 			//LorenzoTxTime:      lorenzoTxTime,
 		}
+		if btcBlockHeight == 0 {
+			bridgeMintTrasanction.BtcBlockHeight = nil
+		}
 
 		err := dbtx.Create(&bridgeMintTrasanction).Error
 		if err != nil {
