@@ -2,6 +2,7 @@ package db
 
 import (
 	"fmt"
+	"github.com/shopspring/decimal"
 	"math/big"
 	"strconv"
 
@@ -18,6 +19,16 @@ const (
 	StatusPending = 0
 	StatusHandled = 1
 	StatusInvalid = 2
+)
+
+const (
+	TransactionTypeMint = 0
+	TransactionTypeBurn = 1
+
+	BridgeTxStatusSuccess    = 0
+	BridgeTxStatusPending    = 1
+	BridgeTxStatusProcessing = 2
+	BridgeTxStatusFailure    = 3
 )
 
 const (
@@ -127,4 +138,68 @@ func (db *MysqlDB) hasDepositTxByTxid(dbtx *gorm.DB, txid string) (bool, error) 
 	}
 
 	return count > 0, nil
+}
+
+func (db *MysqlDB) hasMintTransactionInBridge(dbtx *gorm.DB, txid string) (bool, error) {
+	var count int64
+	result := dbtx.Model(&Transaction{}).Where("btc_txid = ?", txid).Count(&count)
+	if result.Error != nil {
+		return false, result.Error
+	}
+
+	return count > 0, nil
+}
+
+func (db *MysqlDB) InsertMintTransactionToBridge(txs []*BtcDepositTx) (err error) {
+	if len(txs) == 0 {
+		return nil
+	}
+
+	dbtx := db.db.Begin()
+	defer func() {
+		if err != nil {
+			dbtx.Rollback()
+			return
+		}
+
+		dbtx.Commit()
+	}()
+
+	for _, tx := range txs {
+		//check tx is already exist
+		if ok, err := db.hasMintTransactionInBridge(dbtx, tx.Txid); err != nil {
+			return err
+		} else if ok {
+			// maby has inserted mempool transaction before
+			if tx.Height > 0 {
+				if err := dbtx.Model(&Transaction{}).
+					Where("btc_txid=?", tx.Txid).
+					Update("btc_block_height", tx.Height).Error; err != nil {
+					return err
+				}
+			}
+			continue
+		}
+
+		btcBlockHeight := int64(tx.Height)
+		btcTxid := tx.Txid
+		btcRecvAddr := tx.ReceiverAddress
+		bridgeMintTrasanction := Transaction{
+			Type:           TransactionTypeMint,
+			Status:         BridgeTxStatusPending,
+			Amount:         decimal.Zero,
+			BtcBlockHeight: &btcBlockHeight,
+			BtcTxid:        &btcTxid,
+			BtcRecvAddr:    &btcRecvAddr,
+			LorenzoAddr:    tx.LorenzoAddress,
+			//LorenzoTxTime:      lorenzoTxTime,
+		}
+
+		err := dbtx.Create(&bridgeMintTrasanction).Error
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
 }

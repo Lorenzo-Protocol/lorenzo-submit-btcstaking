@@ -6,4 +6,5 @@ type IDB interface {
 	InsertBtcDepositTxs(txs []*BtcDepositTx) error
 	GetUnhandledBtcDepositTxs() ([]*BtcDepositTx, error)
 	UpdateTxStatus(txid string, status int) error
+	InsertMintTransactionToBridge(txs []*BtcDepositTx) (err error)
 }

@@ -126,3 +126,22 @@ func (c *BTCQuery) GetBlockByHeight(height uint64) (*wire.MsgBlock, error) {
 
 	return &msgBlock, nil
 }
+
+func (c *BTCQuery) GetMempoolTxs(address string, lastSeenTxid string) ([]BtcTx, error) {
+	var txs []BtcTx
+	url := c.apiEndpoint + "/address/" + address + "/txs/mempool"
+
+	if lastSeenTxid != "" {
+		url += "/" + lastSeenTxid
+	}
+	resp, err := http.Get(url)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&txs); err != nil {
+		return nil, err
+	}
+
+	return txs, nil
+}

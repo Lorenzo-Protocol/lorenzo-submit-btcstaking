@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"fmt"
+	"github.com/btcsuite/btcd/btcutil"
 	"strings"
 	"sync"
 	"time"
@@ -82,7 +84,18 @@ func NewTxRelayer(database db.IDB, logger *zap.SugaredLogger, conf *config.TxRel
 }
 
 func (r *TxRelayer) Start() error {
-	r.wg.Add(2)
+	r.wg.Add(4)
+
+	go func() {
+		defer r.wg.Done()
+		r.scanBlockForInsertBridgeMintNotDelay()
+	}()
+
+	go func() {
+		defer r.wg.Done()
+		r.fetchMempoolTxsLoop()
+	}()
+
 	go func() {
 		defer r.wg.Done()
 		r.scanBlockLoop()
@@ -105,6 +118,113 @@ func (r *TxRelayer) updateBtcReceiverList(receivers []*types.Receiver) {
 			receiver.Name, receiver.Addr, receiver.EthAddr)
 	}
 	r.logger.Infof("*************** btc deposit receiver list ***************")
+}
+
+func (r *TxRelayer) fetchMempoolTxsLoop() {
+	connectErrWaitInterval := time.Second
+	interval := time.Second
+
+	receiverIndex := 0
+	var validMempoolTxs []*db.BtcDepositTx
+	for {
+		receiver := r.getReceiverByIndex(receiverIndex)
+		if receiver == nil {
+			// after a round mempool search, restart
+			receiverIndex = 0
+			_ = r.db.InsertMintTransactionToBridge(validMempoolTxs)
+			validMempoolTxs = nil // clean, for next round
+			time.Sleep(interval)
+		}
+
+		preTxid := ""
+		for {
+			txs, err := r.btcQuery.GetMempoolTxs(receiver.Addr, preTxid)
+			if err != nil {
+				time.Sleep(connectErrWaitInterval)
+				continue
+			}
+			if len(txs) == 0 {
+				break
+			}
+
+			i := 0
+			for i < len(txs) {
+				tx := txs[i]
+				txBytes, err := r.btcQuery.GetTxBytes(tx.Txid)
+				if err != nil {
+					time.Sleep(connectErrWaitInterval)
+					continue
+				}
+
+				transactionDetail, err := btcutil.NewTxFromBytes(txBytes)
+				if err != nil {
+					continue
+				}
+				// has checked, doesn't check double
+				receiverAddress, _ := btcutil.DecodeAddress(receiver.Addr, r.btcParam)
+				_, ethMintTo, _ := btc.ExtractPaymentToWithOpReturnId(transactionDetail.MsgTx(), receiverAddress)
+
+				var lorenzoMintToAddressHex string
+				if len(ethMintTo) > 0 {
+					lorenzoMintToAddressHex = fmt.Sprintf("%x", ethMintTo)
+				} else {
+					lorenzoMintToAddressHex = receiver.EthAddr
+				}
+
+				depositTx := &db.BtcDepositTx{
+					ReceiverName:    receiver.Name,
+					ReceiverAddress: receiver.Addr,
+					LorenzoAddress:  lorenzoMintToAddressHex,
+					//Amount:          value,
+					Txid:   tx.Txid,
+					Height: 0, // no blockHeight yet
+					Status: db.StatusPending,
+				}
+				validMempoolTxs = append(validMempoolTxs, depositTx)
+			}
+		}
+		receiverIndex++
+	}
+}
+
+func (r *TxRelayer) getReceiverByIndex(i int) *types.Receiver {
+	if i >= len(r.receivers) {
+		return nil
+	}
+
+	return r.receivers[i]
+}
+
+func (r *TxRelayer) scanBlockForInsertBridgeMintNotDelay() {
+	connectErrWaitInterval := time.Second
+	btcInterval := time.Minute
+	fastPoint := r.syncPoint
+	for {
+		btcTip, err := r.btcQuery.GetBTCCurrentHeight()
+		if err != nil {
+			time.Sleep(connectErrWaitInterval)
+			continue
+		}
+
+		wantToGetBlockHeight := fastPoint + 1
+		if wantToGetBlockHeight > btcTip {
+			time.Sleep(btcInterval)
+			continue
+		}
+		msgBlock, err := r.btcQuery.GetBlockByHeight(wantToGetBlockHeight)
+		if err != nil {
+			time.Sleep(connectErrWaitInterval)
+			continue
+		}
+
+		depositTxs := r.getValidDepositTxs(wantToGetBlockHeight, msgBlock)
+		if err := r.db.InsertMintTransactionToBridge(depositTxs); err != nil {
+			time.Sleep(connectErrWaitInterval)
+			continue
+		}
+
+		fastPoint = wantToGetBlockHeight
+	}
 }
 
 func (r *TxRelayer) scanBlockLoop() {
@@ -272,9 +392,10 @@ MainLoop:
 			//	continue MainLoop
 			//}
 
+			receiverDetail := r.GetReceiveByAddress(receiverAddr.String())
 			depositTx := &db.BtcDepositTx{
-				ReceiverName:    r.GetReceiverNameByAddress(receiverAddr.String()),
-				ReceiverAddress: receiverAddr.String(),
+				ReceiverName:    receiverDetail.Name,
+				ReceiverAddress: receiverDetail.Addr,
 				//Amount:          value,
 				Txid:      txid,
 				Height:    blockHeight,
@@ -282,6 +403,13 @@ MainLoop:
 				Status:    db.StatusPending,
 				BlockTime: msgBlock.Header.Timestamp,
 			}
+			_, mintToAddress, _ := btc.ExtractPaymentToWithOpReturnId(tx, receiverAddr)
+			if mintToAddress == nil {
+				depositTx.LorenzoAddress = receiverDetail.EthAddr
+			} else {
+				depositTx.LorenzoAddress = fmt.Sprintf("%x", mintToAddress)
+			}
+
 			depositTxs = append(depositTxs, depositTx)
 			continue MainLoop
 		}
@@ -298,6 +426,16 @@ func (r *TxRelayer) GetReceiverNameByAddress(addr string) string {
 	}
 
 	return ""
+}
+
+func (r *TxRelayer) GetReceiveByAddress(addr string) *types.Receiver {
+	for _, receiver := range r.receivers {
+		if receiver.Addr == addr {
+			return receiver
+		}
+	}
+
+	return nil
 }
 
 func (r *TxRelayer) IsValidDepositReceiver(addr string) bool {
